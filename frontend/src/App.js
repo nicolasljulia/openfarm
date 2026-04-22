@@ -218,7 +218,8 @@ export default function App() {
     setResult(null);
     setNdviTileUrl(null);
     try {
-      const res = await axios.post("http://localhost:8000/analyze", {
+      const API_BASE = process.env.REACT_APP_API_BASE_URL || "http://localhost:8000";
+      const res = await axios.post(`${API_BASE}/analyze`, {
         coordinates, crop_type: crop.toLowerCase(),
       });
       if (res.data.error) {
