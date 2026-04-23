@@ -218,8 +218,7 @@ export default function App() {
     setResult(null);
     setNdviTileUrl(null);
     try {
-      const API_BASE = process.env.REACT_APP_API_BASE_URL || "http://localhost:8000";
-      const res = await axios.post(`${API_BASE}/analyze`, {
+      const res = await axios.post("http://localhost:8000/analyze", {
         coordinates, crop_type: crop.toLowerCase(),
       });
       if (res.data.error) {
@@ -328,6 +327,33 @@ export default function App() {
                 </div>
               </div>
             </div>
+
+            {/* Data freshness */}
+{result.data_sources && (
+  <div style={{ ...s.card, background:"#fafaf8", display:"flex", flexDirection:"column", gap:6 }}>
+    <div style={s.cardLabel}>Data sources</div>
+    <div style={{ display:"flex", flexWrap:"wrap", gap:6 }}>
+      {[
+        { label: "Satellite (Sentinel-2)", date: result.data_sources.satellite, icon: "🛰", color: "#2d5a1b" },
+        { label: "Weather (NASA POWER)", date: result.data_sources.weather,   icon: "🌦", color: "#185FA5" },
+        { label: "Soil (ISRIC)",          date: result.data_sources.soil,     icon: "🪱", color: "#8B6914" },
+        { label: "Climate normals",        date: result.data_sources.climate,  icon: "🌍", color: "#555" },
+      ].map(({ label, date, icon, color }) => (
+        <div key={label} style={{
+          display:"flex", alignItems:"center", gap:6,
+          background:"#fff", border:"0.5px solid #e0e0d8",
+          borderRadius:8, padding:"5px 10px", flex:"1 1 140px",
+        }}>
+          <span style={{ fontSize:14 }}>{icon}</span>
+          <div>
+            <div style={{ fontSize:9, color:"#999", textTransform:"uppercase", letterSpacing:1 }}>{label}</div>
+            <div style={{ fontSize:11, fontWeight:600, color }}>{date}</div>
+          </div>
+        </div>
+      ))}
+    </div>
+  </div>
+)}
 
             {/* Weather context */}
 {result.weather && !result.weather.error && (
