@@ -20,8 +20,6 @@ class FieldRequest(BaseModel):
     coordinates: list
     crop_type: str
 
-
-# ── SOIL DATA ─────────────────────────────────────────────────────────────
 def get_soil_data(coordinates):
     lons = [c[0] for c in coordinates]
     lats = [c[1] for c in coordinates]
@@ -124,7 +122,7 @@ def get_weather_data(lat, lon):
 
         avg_temp_7d    = round(sum(temps_7d) / len(temps_7d), 1)     if temps_7d    else None
         max_temp_7d    = round(max(temps_max_7d), 1)                  if temps_max_7d else None
-        total_precip_7d = round(sum(precip_7d), 1)                   if precip_7d   else None
+        total_precip_7d = round(sum(precip_7d) / 1, 1)               if precip_7d   else None
         avg_rh_7d      = round(sum(rh_7d) / len(rh_7d), 1)          if rh_7d       else None
 
         # Consecutive dry days (< 1mm)
@@ -145,7 +143,6 @@ def get_weather_data(lat, lon):
             else:       break
 
         # Simple ET₀ estimate (Hargreaves): ET₀ = 0.0023 * (T_mean + 17.8) * (T_max - T_min)^0.5 * Ra
-        # Ra approximated as 15 MJ/m²/day average (tropical/subtropical)
         et0_7d = None
         if temps_7d and temps_max_7d:
             temps_min_7d = [t2m_daily[d] for d in dates if t2m_daily.get(d, -999) > -900]
@@ -157,8 +154,7 @@ def get_weather_data(lat, lon):
                     et0_vals.append(0.0023 * (tmean + 17.8) * (td ** 0.5) * 15)
                 et0_7d = round(sum(et0_vals), 1)
 
-        # Rainfall anomaly: compare 7-day total vs climatological mean
-        # Get climatological monthly normals
+        # Rainfall anomaly
         clim_url = (
             f"https://power.larc.nasa.gov/api/temporal/climatology/point"
             f"?parameters=PRECTOTCORR&community=AG"
@@ -166,14 +162,12 @@ def get_weather_data(lat, lon):
         )
         clim_resp = requests.get(clim_url, timeout=15)
         clim_data = clim_resp.json()["properties"]["parameter"]["PRECTOTCORR"]
-        # April normal (current month)
         month_normal_mm = clim_data.get("APR", clim_data.get("ANN", 3.0)) * 30
         weekly_normal   = month_normal_mm / 4
         precip_anomaly_pct = round(
             ((total_precip_7d - weekly_normal) / max(weekly_normal, 0.1)) * 100, 0
         ) if total_precip_7d is not None else None
 
-        # Leaf wetness proxy: RH > 85% + rain in window
         leaf_wetness_risk = (avg_rh_7d or 0) > 80 and (total_precip_7d or 0) > 5
 
         return {
@@ -192,7 +186,6 @@ def get_weather_data(lat, lon):
         return {"error": str(e)}
 
 
-# ── CLIMATE CLASSIFICATION ────────────────────────────────────────────────
 def get_climate_class(lat, lon):
     try:
         power_url = (
@@ -260,29 +253,43 @@ def analyze_field(req: FieldRequest):
     centroid_lat = round(sum(lats) / len(lats), 4)
     centroid_lon = round(sum(lons) / len(lons), 4)
 
-    # Parallel data fetches (soil, weather, climate)
+    # Parallel data fetches
     soil    = get_soil_data(req.coordinates)
     weather = get_weather_data(centroid_lat, centroid_lon)
     climate = get_climate_class(centroid_lat, centroid_lon)
 
-    # ── GEE image collections ─────────────────────────────────────────
     def get_collection(start, end):
         col = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
             .filterBounds(field)
             .filterDate(start, end)
-            .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30)))
-        return col.median() if col.size().getInfo() > 0 else None
+            .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30))
+            .sort('system:time_start', False))
+        size = col.size().getInfo()
+        if size == 0:
+            return None, None
+        most_recent = col.first()
+        date_ms = most_recent.get('system:time_start').getInfo()
+        from datetime import datetime, timezone
+        date_str = datetime.fromtimestamp(date_ms / 1000, tz=timezone.utc).strftime('%d %b %Y')
+        return col.median(), date_str
 
-    img = get_collection('2025-01-01', '2025-04-20')
+    from datetime import date
+    today = date.today().strftime('%Y-%m-%d')
+
+    img, satellite_date = get_collection('2025-01-01', today)
     if img is None:
-        img = get_collection('2024-09-01', '2025-04-20')
+        img, satellite_date = get_collection('2024-06-01', today)
     if img is None:
         return {"error": "No cloud-free satellite imagery found for this location."}
 
-    early_img = get_collection('2024-07-01', '2024-12-31')
+    early_img, _ = get_collection('2024-01-01', '2024-12-31')
 
-    # ── Full index stack ──────────────────────────────────────────────
-    # Normalise bands to 0-1 range
+    # Dates
+    from datetime import date as dt
+    weather_date = dt.today().strftime('%d %b %Y')
+    soil_date = "SoilGrids 2.0 (2020 baseline)"
+
+    # Normalise bands
     b2  = img.select('B2').divide(10000)
     b3  = img.select('B3').divide(10000)
     b4  = img.select('B4').divide(10000)
@@ -293,39 +300,28 @@ def analyze_field(req: FieldRequest):
     b8a = img.select('B8A').divide(10000)
     b11 = img.select('B11').divide(10000)
 
-    # Group A — early stage / sparse canopy
+    # Indices
     msavi = (b8.multiply(2).add(1).subtract(
         b8.multiply(2).add(1).pow(2).subtract(b8.subtract(b4).multiply(8)).sqrt()
     )).divide(2).rename('MSAVI')
-
     savi = b8.subtract(b4).divide(b8.add(b4).add(0.5)).multiply(1.5).rename('SAVI')
-
-    # Group B — general vigour
     ndvi  = img.normalizedDifference(['B8','B4']).rename('NDVI')
     evi   = b8.subtract(b4).multiply(2.5).divide(
         b8.add(b4.multiply(6)).subtract(b2.multiply(7.5)).add(1)
     ).rename('EVI')
     gndvi = b8.subtract(b3).divide(b8.add(b3)).rename('GNDVI')
-
-    # Group C — chlorophyll / nitrogen
     ndre  = img.normalizedDifference(['B8A','B5']).rename('NDRE')
     reci  = b7.divide(b5).subtract(1).rename('ReCI')
     gci   = b8a.divide(b3).subtract(1).rename('GCI')
-
-    # Group D — moisture
     ndmi  = img.normalizedDifference(['B8','B11']).rename('NDMI')
     ndwi  = img.normalizedDifference(['B3','B8']).rename('NDWI')
-
-    # Group E — senescence
     psri  = b4.subtract(b2).divide(b6).rename('PSRI')
 
-    # Stack all indices
     index_stack = (ndvi.addBands(ndmi).addBands(ndre).addBands(evi)
                        .addBands(msavi).addBands(savi).addBands(gndvi)
                        .addBands(reci).addBands(gci).addBands(ndwi)
                        .addBands(psri))
 
-    # ── Zonal statistics: mean + p10 + p90 ───────────────────────────
     def zonal_stats(image, band):
         stats = image.reduceRegion(
             reducer=ee.Reducer.mean()
@@ -340,10 +336,6 @@ def analyze_field(req: FieldRequest):
             "p90":  stats.get(f"{band}_p90"),
         }
 
-    def mean_val(stats):
-        return stats["mean"]
-
-    # Get all index stats
     ndvi_stats  = zonal_stats(index_stack, 'NDVI')
     ndmi_stats  = zonal_stats(index_stack, 'NDMI')
     ndre_stats  = zonal_stats(index_stack, 'NDRE')
@@ -356,23 +348,21 @@ def analyze_field(req: FieldRequest):
     ndwi_stats  = zonal_stats(index_stack, 'NDWI')
     psri_stats  = zonal_stats(index_stack, 'PSRI')
 
-    mean_ndvi  = mean_val(ndvi_stats)
-    mean_ndmi  = mean_val(ndmi_stats)
-    mean_ndre  = mean_val(ndre_stats)
-    mean_evi   = mean_val(evi_stats)
-    mean_msavi = mean_val(msavi_stats)
-    mean_gndvi = mean_val(gndvi_stats)
-    mean_reci  = mean_val(reci_stats)
-    mean_gci   = mean_val(gci_stats)
-    mean_ndwi  = mean_val(ndwi_stats)
-    mean_psri  = mean_val(psri_stats)
+    mean_ndvi  = ndvi_stats["mean"]
+    mean_ndmi  = ndmi_stats["mean"]
+    mean_ndre  = ndre_stats["mean"]
+    mean_evi   = evi_stats["mean"]
+    mean_msavi = msavi_stats["mean"]
+    mean_gndvi = gndvi_stats["mean"]
+    mean_reci  = reci_stats["mean"]
+    mean_gci   = gci_stats["mean"]
+    mean_ndwi  = ndwi_stats["mean"]
+    mean_psri  = psri_stats["mean"]
 
-    # Within-field heterogeneity score (p90 - p10 spread on NDVI)
     ndvi_spread = None
     if ndvi_stats["p90"] is not None and ndvi_stats["p10"] is not None:
         ndvi_spread = round(ndvi_stats["p90"] - ndvi_stats["p10"], 3)
 
-    # NDVI trend
     ndvi_change = 0
     if early_img is not None:
         early_ndvi = early_img.normalizedDifference(['B8','B4'])
@@ -382,7 +372,6 @@ def analyze_field(req: FieldRequest):
         if early_val:
             ndvi_change = round(mean_ndvi - early_val, 3)
 
-    # Zone breakdown
     def zone_pct(lo, hi):
         zone   = ndvi.gte(lo).And(ndvi.lt(hi))
         total  = zone.reduceRegion(reducer=ee.Reducer.sum(),  geometry=field, scale=10).getInfo().get('NDVI', 0)
@@ -396,7 +385,6 @@ def analyze_field(req: FieldRequest):
         "severe_pct":   zone_pct(-1,  0.2),
     }
 
-    # ── NDVI tile URL ─────────────────────────────────────────────────
     ndvi_vis = {
         'min': 0.0, 'max': 0.8,
         'palette': ['#d73027','#f46d43','#fdae61','#fee08b',
@@ -404,7 +392,6 @@ def analyze_field(req: FieldRequest):
     }
     tile_url = ndvi.getMapId(ndvi_vis)['tile_fetcher'].url_format
 
-    # ── Classifications ───────────────────────────────────────────────
     if mean_ndvi < 0.2:   health = "Severe stress"
     elif mean_ndvi < 0.4: health = "Moderate stress"
     elif mean_ndvi < 0.6: health = "Fair"
@@ -420,22 +407,17 @@ def analyze_field(req: FieldRequest):
     elif mean_ndre < 0.35:      nitrogen = "Moderate"
     else:                       nitrogen = "Sufficient"
 
-    # Field heterogeneity flag
     if ndvi_spread is None:     heterogeneity = "Unknown"
     elif ndvi_spread < 0.15:    heterogeneity = "Uniform"
     elif ndvi_spread < 0.25:    heterogeneity = "Moderate variation"
     else:                       heterogeneity = "High variation — stress hotspots likely"
 
-    # ── Risk engine (weather-informed + multi-index) ──────────────────
     risks = []
-    w = weather  # shorthand
-
-    # 1. Declining health
+    w = weather
     if ndvi_change < -0.05:
         risks.append({"name": "Declining crop health", "level": "High",
                       "detail": f"NDVI dropped {abs(ndvi_change):.2f} over 3 months"})
 
-    # 2. Water stress — now uses consecutive dry days + ET₀
     dry_days = w.get("consecutive_dry_days", 0) if not w.get("error") else 0
     et0      = w.get("et0_7d_mm", 0) or 0
     precip7  = w.get("total_precip_7d_mm", 999) or 999
@@ -444,7 +426,6 @@ def analyze_field(req: FieldRequest):
         risks.append({"name": "Water stress", "level": level,
                       "detail": f"Moisture index {mean_ndmi:.2f}, {dry_days} consecutive dry days, ET₀ {et0}mm this week"})
 
-    # 3. Waterlogging — NDWI + wet days + soil drainage
     wet_days      = w.get("consecutive_wet_days", 0) if not w.get("error") else 0
     clay_pct      = soil.get("clay_pct", 0) if not soil.get("error") else 0
     poor_drainage = clay_pct > 35 or (soil.get("drainage","") == "Poor — waterlogging risk")
@@ -452,7 +433,6 @@ def analyze_field(req: FieldRequest):
         risks.append({"name": "Waterlogging risk", "level": "High" if poor_drainage else "Medium",
                       "detail": f"NDWI {mean_ndwi:.2f}, {wet_days} consecutive wet days{', clay soil' if poor_drainage else ''}"})
 
-    # 4. Fungal disease — now weather-gated
     avg_rh   = w.get("avg_rh_7d_pct", 0) if not w.get("error") else 0
     leaf_wet = w.get("leaf_wetness_risk", False) if not w.get("error") else False
     if req.crop_type in ["rice","maize","wheat","potato","soybean"] and mean_ndvi < 0.55:
@@ -461,48 +441,35 @@ def analyze_field(req: FieldRequest):
             risks.append({"name": "Fungal disease risk", "level": level,
                           "detail": f"RH {avg_rh}%, {wet_days} wet days, leaf wetness conditions present"})
         else:
-            risks.append({"name": "Fungal disease risk", "level": "Low",
-                          "detail": "Crop stress present but humidity conditions not yet critical"})
+            risks.append({"name": "Fungal disease risk", "level": "Low", "detail": "Crop stress present but humidity conditions not yet critical"})
 
-    # 5. Nitrogen deficiency — now requires NDRE + ReCI corroboration (SOP: 2+ indices)
     reci_low = mean_reci is not None and mean_reci < 1.5
-    gci_low  = mean_gci  is not None and mean_gci  < 2.0
+    gci_low  = mean_gci is not None and mean_gci < 2.0
     if mean_ndre is not None and mean_ndre < 0.2 and (reci_low or gci_low):
-        risks.append({"name": "Nitrogen deficiency", "level": "Medium",
-                      "detail": f"NDRE {mean_ndre:.2f}, ReCI {mean_reci:.2f if mean_reci else '—'} — two indices confirm low N"})
+        reci_text = f"{mean_reci:.2f}" if mean_reci is not None else "—"
+        risks.append({"name": "Nitrogen deficiency", "level": "Medium", "detail": f"NDRE {mean_ndre:.2f}, ReCI {reci_text} — two indices confirm low N"})
 
-    # 6. Heat stress — max temp + EVI/GCI declining
     max_t = w.get("max_temp_7d") if not w.get("error") else None
     if max_t and max_t > 34:
         risks.append({"name": "Heat stress", "level": "High" if max_t > 38 else "Medium",
                       "detail": f"7-day max temp {max_t}°C — above critical threshold for most crops"})
 
-    # 7. Severe zone detected
     if zones["severe_pct"] > 15:
-        risks.append({"name": "Severe stress zone", "level": "High",
-                      "detail": f"{zones['severe_pct']}% of field in severe stress (NDVI < 0.2) — prioritize scouting"})
+        risks.append({"name": "Severe stress zone", "level": "High", "detail": f"{zones['severe_pct']}% of field in severe stress (NDVI < 0.2)"})
 
-    # 8. High spatial heterogeneity
     if ndvi_spread and ndvi_spread > 0.25:
-        risks.append({"name": "Uneven crop development", "level": "Medium",
-                      "detail": f"NDVI spread {ndvi_spread} — large within-field variation suggests patchy stress or emergence failure"})
+        risks.append({"name": "Uneven crop development", "level": "Medium", "detail": f"NDVI spread {ndvi_spread} — variation suggests patchy stress"})
 
-    # 9. Soil-informed risks
     if not soil.get("error"):
         if soil.get("sand_pct", 0) > 65 and mean_ndmi < 0.0:
-            risks.append({"name": "Sandy soil + moisture deficit", "level": "High",
-                          "detail": f"Sand {soil['sand_pct']}% — water retention very low, irrigation critical"})
+            risks.append({"name": "Sandy soil + moisture deficit", "level": "High", "detail": f"Sand {soil['sand_pct']}% — irrigation critical"})
         if soil.get("ph", 7) < 5.5:
-            risks.append({"name": "Acidic soil", "level": "Medium",
-                          "detail": f"pH {soil['ph']} — may limit nutrient uptake. Consider liming."})
+            risks.append({"name": "Acidic soil", "level": "Medium", "detail": f"pH {soil['ph']} — consider liming"})
         if soil.get("soc_g_kg", 20) < 8:
-            risks.append({"name": "Low organic carbon", "level": "Low",
-                          "detail": f"SOC {soil['soc_g_kg']} g/kg — poor soil health, consider compost"})
+            risks.append({"name": "Low organic carbon", "level": "Low", "detail": f"SOC {soil['soc_g_kg']} g/kg — consider compost"})
 
-    # ── Action engine ─────────────────────────────────────────────────
     actions = []
     risk_names = [r["name"] for r in risks]
-
     if "Water stress" in risk_names:
         urgency = "Today" if any(r["level"] == "High" and r["name"] == "Water stress" for r in risks) else "Within 3 days"
         actions.append({"action": "Irrigate affected areas", "urgency": urgency})
@@ -523,57 +490,46 @@ def analyze_field(req: FieldRequest):
     if "Sandy soil + moisture deficit" in risk_names:
         actions.append({"action": "Increase irrigation frequency — sandy soils drain fast", "urgency": "Within 2 days"})
 
-    # ── Build response ────────────────────────────────────────────────
     def safe_round(val, digits=3):
         return round(val, digits) if val is not None else None
 
     return {
-        # Core health
-        "ndvi":              safe_round(mean_ndvi),
-        "ndvi_change":       safe_round(ndvi_change),
-        "health_status":     health,
-        "heterogeneity":     heterogeneity,
-        "ndvi_spread":       ndvi_spread,
-        "zones":             zones,
-
-        # Full index stack
+        "ndvi": safe_round(mean_ndvi),
+        "ndvi_change": safe_round(ndvi_change),
+        "health_status": health,
+        "heterogeneity": heterogeneity,
+        "ndvi_spread": ndvi_spread,
+        "zones": zones,
         "indices": {
-            "NDVI":  {"mean": safe_round(mean_ndvi),  "p10": safe_round(ndvi_stats["p10"]),  "p90": safe_round(ndvi_stats["p90"]),  "label": "Crop health"},
-            "EVI":   {"mean": safe_round(mean_evi),   "p10": safe_round(evi_stats["p10"]),   "p90": safe_round(evi_stats["p90"]),   "label": "Canopy vigour"},
+            "NDVI": {"mean": safe_round(mean_ndvi), "p10": safe_round(ndvi_stats["p10"]), "p90": safe_round(ndvi_stats["p90"]), "label": "Crop health"},
+            "EVI": {"mean": safe_round(mean_evi), "p10": safe_round(evi_stats["p10"]), "p90": safe_round(evi_stats["p90"]), "label": "Canopy vigour"},
             "MSAVI": {"mean": safe_round(mean_msavi), "p10": safe_round(msavi_stats["p10"]), "p90": safe_round(msavi_stats["p90"]), "label": "Sparse canopy"},
             "GNDVI": {"mean": safe_round(mean_gndvi), "p10": safe_round(gndvi_stats["p10"]), "p90": safe_round(gndvi_stats["p90"]), "label": "Chlorophyll"},
-            "NDMI":  {"mean": safe_round(mean_ndmi),  "p10": safe_round(ndmi_stats["p10"]),  "p90": safe_round(ndmi_stats["p90"]),  "label": moisture},
-            "NDWI":  {"mean": safe_round(mean_ndwi),  "p10": safe_round(ndwi_stats["p10"]),  "p90": safe_round(ndwi_stats["p90"]),  "label": "Surface water"},
-            "NDRE":  {"mean": safe_round(mean_ndre),  "p10": safe_round(ndre_stats["p10"]),  "p90": safe_round(ndre_stats["p90"]),  "label": nitrogen + " N"},
-            "ReCI":  {"mean": safe_round(mean_reci),  "p10": safe_round(reci_stats["p10"]),  "p90": safe_round(reci_stats["p90"]),  "label": "Chlorophyll index"},
-            "GCI":   {"mean": safe_round(mean_gci),   "p10": safe_round(gci_stats["p10"]),   "p90": safe_round(gci_stats["p90"]),   "label": "Green chlorophyll"},
-            "PSRI":  {"mean": safe_round(mean_psri),  "p10": safe_round(psri_stats["p10"]),  "p90": safe_round(psri_stats["p90"]),  "label": "Senescence"},
+            "NDMI": {"mean": safe_round(mean_ndmi), "p10": safe_round(ndmi_stats["p10"]), "p90": safe_round(ndmi_stats["p90"]), "label": moisture},
+            "NDWI": {"mean": safe_round(mean_ndwi), "p10": safe_round(ndwi_stats["p10"]), "p90": safe_round(ndwi_stats["p90"]), "label": "Surface water"},
+            "NDRE": {"mean": safe_round(mean_ndre), "p10": safe_round(ndre_stats["p10"]), "p90": safe_round(ndre_stats["p90"]), "label": nitrogen + " N"},
+            "ReCI": {"mean": safe_round(mean_reci), "p10": safe_round(reci_stats["p10"]), "p90": safe_round(reci_stats["p90"]), "label": "Chlorophyll index"},
+            "GCI": {"mean": safe_round(mean_gci), "p10": safe_round(gci_stats["p10"]), "p90": safe_round(gci_stats["p90"]), "label": "Green chlorophyll"},
+            "PSRI": {"mean": safe_round(mean_psri), "p10": safe_round(psri_stats["p10"]), "p90": safe_round(psri_stats["p90"]), "label": "Senescence"},
         },
-
-        # Legacy fields for frontend compatibility
-        "ndmi":     safe_round(mean_ndmi),
-        "ndre":     safe_round(mean_ndre),
+        "ndmi": safe_round(mean_ndmi),
+        "ndre": safe_round(mean_ndre),
         "moisture": moisture,
         "nitrogen": nitrogen,
-
-        # Weather
-        "weather":  weather,
-
-        # Soil
-        "soil":     soil,
-
-        # Climate
-        "climate":  climate,
-
-        # Risks + actions
-        "risks":    risks,
-        "actions":  actions,
+        "weather": weather,
+        "soil": soil,
+        "climate": climate,
+        "risks": risks,
+        "actions": actions,
         "crop_type": req.crop_type,
-
-        # Map overlay
         "ndvi_tile_url": tile_url,
+        "data_sources": {
+            "satellite": satellite_date,
+            "weather": weather_date,
+            "soil": soil_date,
+            "climate": "NASA POWER climatology (1984–2022)",
+        },
     }
-
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
